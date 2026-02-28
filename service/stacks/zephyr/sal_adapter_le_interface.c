@@ -22,6 +22,8 @@
 #include "sal_gatt_client_interface.h"
 #include "sal_gatt_server_interface.h"
 #include "sal_interface.h"
+#include "sal_zblue.h"
+#include "sal_zephyr_interface.h"
 #include "service_loop.h"
 
 #include <zephyr/bluetooth/bluetooth.h>
@@ -55,12 +57,6 @@ typedef union {
     int security_level;
     bool bondable;
 } sal_adapter_args_t;
-
-typedef struct {
-    struct bt_conn* conn;
-    bt_address_t addr;
-    uint8_t role; // e.g., GATT_ROLE_SERVER
-} le_conn_info_t;
 
 typedef struct {
     bt_controller_id_t id;
@@ -111,9 +107,6 @@ static enum bt_security_err zblue_on_pairing_accept(struct bt_conn* conn, const 
 static void zblue_register_callback(void);
 static void zblue_unregister_callback(void);
 
-static le_conn_info_t* le_conn_add(const bt_address_t* addr);
-static le_conn_info_t* le_conn_find(const bt_address_t* addr);
-
 static struct bt_conn_cb g_conn_cbs = {
     .connected = zblue_on_connected,
     .disconnected = zblue_on_disconnected,
@@ -143,7 +136,6 @@ static struct bt_settings_zblue_cb g_setting_cbs = {
 #endif
 
 static struct bt_conn_auth_cb g_conn_auth_cbs;
-static le_conn_info_t g_le_conn_info[CONFIG_BT_MAX_CONN];
 static bt_security_t g_security_level = BT_SECURITY_L2;
 
 static uint8_t zblue_convert_addr_type(ble_addr_type_t addr_type)
@@ -383,7 +375,7 @@ static void zblue_on_connected(struct bt_conn* conn, uint8_t err)
 {
     uint8_t role;
     struct bt_conn_info info;
-    le_conn_info_t* slot;
+    bt_conn_info_t* slot;
 #if defined(CONFIG_BLUETOOTH_GATT_CLIENT) || defined(CONFIG_BLUETOOTH_GATT_SERVER)
     profile_connection_state_t profile_state = PROFILE_STATE_CONNECTED;
 #endif
@@ -424,7 +416,7 @@ static void zblue_on_connected(struct bt_conn* conn, uint8_t err)
         }
     }
 
-    slot = le_conn_add(&state.addr);
+    slot = bt_conn_add(&state.addr, BT_TRANSPORT_BLE);
 
     if (!slot) {
         return;
@@ -440,7 +432,7 @@ static void zblue_on_connected(struct bt_conn* conn, uint8_t err)
     role = slot->role;
 
     if (err || (slot->conn == NULL)) {
-        le_conn_remove(&state.addr);
+        bt_conn_remove(&state.addr, BT_TRANSPORT_BLE);
         slot = NULL;
     }
 
@@ -484,7 +476,7 @@ bt_status_t bt_sal_get_identity_addr(bt_address_t* addr, bt_address_t* id_addr)
 static void zblue_on_disconnected(struct bt_conn* conn, uint8_t reason)
 {
     struct bt_conn_info info;
-    le_conn_info_t* slot;
+    bt_conn_info_t* slot;
     uint8_t role;
     bt_address_t le_addr;
     bt_address_t* remote_addr;
@@ -515,14 +507,14 @@ static void zblue_on_disconnected(struct bt_conn* conn, uint8_t reason)
         state.addr_type = info.le.remote->type;
     }
 
-    slot = le_conn_find(&state.addr);
+    slot = bt_conn_find(&state.addr, BT_TRANSPORT_BLE);
 
     if (!slot) {
         return;
     }
 
     role = slot->role;
-    le_conn_remove(&state.addr);
+    bt_conn_remove(&state.addr, BT_TRANSPORT_BLE);
     slot = NULL;
 
     adapter_on_connection_state_changed(&state);
@@ -843,32 +835,20 @@ static bt_status_t sal_send_req(sal_adapter_req_t* req)
     return BT_STATUS_SUCCESS;
 }
 
-static le_conn_info_t* le_conn_find(const bt_address_t* addr)
-{
-    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
-        if (!bt_addr_compare(&g_le_conn_info[i].addr, addr)) {
-            return &g_le_conn_info[i];
-        }
-    }
-
-    return NULL;
-}
-
 bt_status_t get_le_addr_from_conn(struct bt_conn* conn, bt_address_t* addr)
 {
     struct bt_conn_info info;
-    bt_address_t* resolved_addr;
+    bt_address_t *resolved_addr, *address;
 
     /* Check local connection info table first */
-    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
-        if (g_le_conn_info[i].conn == conn) {
-            memcpy(addr, &g_le_conn_info[i].addr, sizeof(bt_address_t));
-            return BT_STATUS_SUCCESS;
-        }
+    address = bt_conn_get_addr(conn);
+    if (address) {
+        memcpy(addr, address, sizeof(bt_address_t));
+        return BT_STATUS_SUCCESS;
     }
 
     /*
-     * Fallback: g_le_conn_info may not be initialized yet if certain events
+     * Fallback: g_conn_info may not be initialized yet if certain events
      * (e.g. MTU exchange) occur before the connected callback.
      * Use Zephyr's internal connection info as a fallback source.
      */
@@ -897,84 +877,11 @@ bt_status_t get_le_addr_from_conn(struct bt_conn* conn, bt_address_t* addr)
 
 struct bt_conn* get_le_conn_from_addr(bt_address_t* addr)
 {
-    le_conn_info_t* info;
+    bt_conn_info_t* info;
 
-    info = le_conn_find(addr);
+    info = bt_conn_find(addr, BT_TRANSPORT_BLE);
 
     return info ? info->conn : NULL;
-}
-
-static le_conn_info_t* le_conn_add(const bt_address_t* addr)
-{
-    le_conn_info_t* info = le_conn_find(addr);
-    if (info) {
-        return info;
-    }
-
-    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
-        if (!g_le_conn_info[i].conn && bt_addr_is_empty(&g_le_conn_info[i].addr)) {
-            memcpy(g_le_conn_info[i].addr.addr, addr->addr, BT_ADDR_LENGTH);
-            return &g_le_conn_info[i];
-        }
-    }
-
-    BT_LOGE("%s, no free entry", __func__);
-    return NULL;
-}
-
-bt_status_t le_conn_set_role(bt_address_t* addr, uint8_t flag)
-{
-    le_conn_info_t* info;
-
-    if (bt_addr_is_empty(addr) || !flag) {
-        BT_LOGE("%s, invalid addr or flag", __func__);
-        return BT_STATUS_FAIL;
-    }
-
-    info = le_conn_find(addr);
-    if (info) {
-        if (info->role & flag) {
-            BT_LOGD("conn flag already set, skip");
-            return BT_STATUS_DONE;
-        }
-
-        info->role |= flag;
-
-        if (info->conn) {
-            if ((info->role & GATT_ROLE_CLIENT) && flag == GATT_ROLE_SERVER) {
-#ifdef CONFIG_BLUETOOTH_GATT_SERVER
-                bt_sal_gatt_server_connection_state_changed_callback(PRIMARY_ADAPTER, &info->addr, PROFILE_STATE_CONNECTED);
-#endif
-            } else if ((info->role & GATT_ROLE_SERVER) && flag == GATT_ROLE_CLIENT) {
-#ifdef CONFIG_BLUETOOTH_GATT_CLIENT
-                bt_sal_gatt_client_connection_state_changed_callback(PRIMARY_ADAPTER, &info->addr, PROFILE_STATE_CONNECTED);
-#endif
-            }
-            return BT_STATUS_DONE;
-        }
-
-        return BT_STATUS_SUCCESS;
-    }
-
-    info = le_conn_add(addr);
-    if (info) {
-        info->role = flag;
-        return BT_STATUS_SUCCESS;
-    }
-
-    return BT_STATUS_FAIL;
-}
-
-bt_status_t le_conn_remove(bt_address_t* addr)
-{
-    le_conn_info_t* info = le_conn_find(addr);
-    if (info) {
-        memset(info, 0, sizeof(*info));
-        return BT_STATUS_SUCCESS;
-    }
-
-    BT_LOGD("%s, addr not found", __func__);
-    return BT_STATUS_FAIL;
 }
 
 bt_status_t bt_sal_le_init(const bt_vhal_interface* vhal)
@@ -1133,6 +1040,9 @@ bt_status_t bt_sal_le_set_io_capability(bt_controller_id_t id, bt_io_capability_
         g_conn_auth_cbs.cancel = zblue_on_auth_cancel;
         break;
     case BT_IO_CAPABILITY_NOINPUTNOOUTPUT:
+#ifndef CONFIG_HCI_AUTO_REPLY_IN_JUST_WORK
+        g_conn_auth_cbs.passkey_confirm = zblue_on_auth_passkey_confirm;
+#endif
         g_conn_auth_cbs.cancel = zblue_on_auth_cancel;
         break;
     default:
@@ -1228,6 +1138,7 @@ static void STACK_CALL(le_set_bond)(void* args)
 
 #ifdef CONFIG_SETTINGS_ZBLUE
     bt_settings_load(req->id, req->adpt.le_set_bond.id, req->adpt.le_set_bond.key, &le_addr);
+    bt_settings_commit(req->id, req->adpt.le_set_bond.id, req->adpt.le_set_bond.key, &le_addr);
 #endif
 }
 
@@ -1549,6 +1460,8 @@ bt_status_t bt_sal_le_smp_reply(bt_controller_id_t id, bt_address_t* addr, bool 
 
     switch (type) {
     case PAIR_TYPE_PASSKEY_CONFIRMATION:
+        SAL_CHECK(bt_conn_auth_passkey_confirm(conn), 0);
+        break;
     case PAIR_TYPE_CONSENT:
         SAL_CHECK(bt_conn_auth_pairing_confirm(conn), 0);
         break;
@@ -1589,11 +1502,19 @@ bt_status_t bt_sal_le_get_local_oob_data(bt_controller_id_t id, bt_address_t* ad
 static void STACK_CALL(add_white_list)(void* args)
 {
     sal_adapter_req_t* req = args;
+    bt_address_t id_addr;
     bt_addr_le_t addr;
     int err;
 
-    addr.type = req->addr_type;
-    memcpy(&addr.a, &req->addr, sizeof(addr.a));
+    if (adapter_get_remote_identity_address(&req->addr, &id_addr) == BT_STATUS_SUCCESS) {
+        memcpy(&addr.a, &id_addr, sizeof(addr.a));
+        /** TODO: consider random (static) identity address */
+        addr.type = BT_LE_ADDR_TYPE_PUBLIC;
+    } else {
+        memcpy(&addr.a, &req->addr, sizeof(addr.a));
+        addr.type = adapter_get_le_remote_address_type(&req->addr);
+        BT_LOGD("%s, no public identity address", __func__);
+    }
 
     err = bt_le_filter_accept_list_add(&addr);
     if (err) {
@@ -1628,13 +1549,21 @@ bt_status_t bt_sal_le_add_white_list(bt_controller_id_t id, bt_address_t* addres
 static void STACK_CALL(remove_white_list)(void* args)
 {
     sal_adapter_req_t* req = args;
+    bt_address_t id_addr;
     bt_addr_le_t addr;
     int err;
 
-    addr.type = req->addr_type;
-    memcpy(&addr.a, &req->addr, sizeof(addr.a));
+    if (adapter_get_remote_identity_address(&req->addr, &id_addr) == BT_STATUS_SUCCESS) {
+        memcpy(&addr.a, &id_addr, sizeof(addr.a));
+        addr.type = BT_LE_ADDR_TYPE_PUBLIC;
+        /** TODO: consider random (static) identity address */
+    } else {
+        memcpy(&addr.a, &req->addr, sizeof(addr.a));
+        addr.type = adapter_get_le_remote_address_type(&req->addr);
+        BT_LOGD("%s, no public identity address", __func__);
+    }
 
-    err = bt_le_filter_accept_list_add(&addr);
+    err = bt_le_filter_accept_list_remove(&addr);
     if (err) {
         BT_LOGE("%s, remove white list fail, err:%d", __func__, err);
         adapter_on_whitelist_update(&req->addr, false, BT_STATUS_FAIL);

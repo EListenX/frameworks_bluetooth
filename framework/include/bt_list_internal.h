@@ -1,5 +1,5 @@
 /****************************************************************************
- * include/nuttx/list.h
+ * include/bt_list_internal.h
  *
  * Extracted from logic originally written by Travis Geiselbrecht and
  * released under a public domain license.  Re-released here under the 3-
@@ -37,12 +37,14 @@
  *
  ****************************************************************************/
 
-#ifndef __INCLUDE_NUTTX_LIST_H
-#define __INCLUDE_NUTTX_LIST_H
+#ifndef __INCLUDE_BT_LIST_INTERNAL_H
+#define __INCLUDE_BT_LIST_INTERNAL_H
 
 /****************************************************************************
  * Included Files
  ****************************************************************************/
+
+#ifndef __NuttX__
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -135,15 +137,6 @@
     do {                       \
         list_delete(item);     \
         list_initialize(item); \
-    } while (0)
-
-#define list_merge(list_dst, list_src)             \
-    do {                                           \
-        (list_dst)->prev->next = (list_src)->next; \
-        (list_src)->next->prev = (list_dst)->prev; \
-        (list_src)->prev->next = (list_dst);       \
-        (list_dst)->prev = (list_src)->prev;       \
-        list_initialize(list_src);                 \
     } while (0)
 
 #define list_remove_head_type(list, type, member)              \
@@ -282,8 +275,8 @@
  ****************************************************************************/
 
 struct list_node {
-    FAR struct list_node* prev;
     FAR struct list_node* next;
+    FAR struct list_node* prev;
 };
 
 /****************************************************************************
@@ -327,4 +320,19 @@ static inline size_t list_length(FAR struct list_node* list)
     return cnt;
 }
 
-#endif /* __INCLUDE_NUTTX_LIST_H */
+#else // defined(__NuttX__)
+#include <nuttx/list.h>
+#endif // #ifndef __NuttX__
+
+/* Define Bluetooth proprietary macros hereafter */
+
+#define list_merge(list_dst, list_src)             \
+    do {                                           \
+        (list_dst)->prev->next = (list_src)->next; \
+        (list_src)->next->prev = (list_dst)->prev; \
+        (list_src)->prev->next = (list_dst);       \
+        (list_dst)->prev = (list_src)->prev;       \
+        list_initialize(list_src);                 \
+    } while (0)
+
+#endif /* __INCLUDE_BT_LIST_INTERNAL_H */

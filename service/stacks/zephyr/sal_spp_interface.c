@@ -82,6 +82,9 @@ typedef struct {
     struct bt_sdp_attribute* attrs;
     uint8_t uuid128[BT_UUID_SIZE_128];
     uint16_t channel;
+    struct bt_sdp_data_elem svclass_id_list[1];
+    struct bt_sdp_data_elem proto_desc_list[2];
+    struct bt_sdp_data_elem proto_desc_rfcomm[2];
 } spp_sdp_record_t;
 
 typedef struct {
@@ -287,32 +290,41 @@ struct bt_sdp_record* spp_sdp_create_record(uint16_t channel, bt_uuid_t* uuid)
     attrs_count = ARRAY_SIZE(spp_attrs_template);
     memcpy(spp_record->attrs, spp_attrs_template, sizeof(spp_attrs_template));
 
-    sys_memcpy_swap(spp_record->uuid128, uuid->val.u128, BT_UUID_SIZE_128);
+    memcpy(spp_record->uuid128, uuid->val.u128, BT_UUID_SIZE_128);
     spp_record->channel = channel;
 
     for (int i = 0; i < attrs_count; i++) {
         if (spp_record->attrs[i].id == BT_SDP_ATTR_SVCLASS_ID_LIST) {
-            struct bt_sdp_data_elem* element = (struct bt_sdp_data_elem*)&spp_record->attrs[i].val;
+            spp_record->svclass_id_list[0] = (struct bt_sdp_data_elem) {
+                BT_SDP_TYPE_SIZE(BT_SDP_UUID128),
+                .data = spp_record->uuid128,
+            };
 
-            element = (struct bt_sdp_data_elem*)element[0].data;
-            element->type = BT_SDP_UUID128;
-            element->data = spp_record->uuid128;
+            spp_record->attrs[i].val.data = spp_record->svclass_id_list;
         } else if (spp_record->attrs[i].id == BT_SDP_ATTR_PROTO_DESC_LIST) {
-            struct bt_sdp_data_elem* element = (struct bt_sdp_data_elem*)&spp_record->attrs[i].val;
+            struct bt_sdp_data_elem* list_tmpl = (struct bt_sdp_data_elem*)spp_record->attrs[i].val.data;
+            struct bt_sdp_data_elem* rfcomm_tmpl = NULL;
 
-            element = (struct bt_sdp_data_elem*)element->data;
-            if (!element) {
+            if (!list_tmpl) {
                 BT_LOGE("SPP Descriptor List PROTO_DESC is NULL");
                 goto fail;
             }
 
-            element = (struct bt_sdp_data_elem*)element[1].data;
-            if (!element) {
+            spp_record->proto_desc_list[0] = list_tmpl[0];
+            spp_record->proto_desc_list[1] = list_tmpl[1];
+
+            rfcomm_tmpl = (struct bt_sdp_data_elem*)spp_record->proto_desc_list[1].data;
+            if (!rfcomm_tmpl) {
                 BT_LOGE("SPP Descriptor List Channel is NULL");
                 goto fail;
             }
 
-            element[1].data = &spp_record->channel;
+            spp_record->proto_desc_rfcomm[0] = rfcomm_tmpl[0];
+            spp_record->proto_desc_rfcomm[1] = rfcomm_tmpl[1];
+            spp_record->proto_desc_rfcomm[1].data = &spp_record->channel;
+
+            spp_record->proto_desc_list[1].data = spp_record->proto_desc_rfcomm;
+            spp_record->attrs[i].val.data = spp_record->proto_desc_list;
         }
     }
 
@@ -340,6 +352,8 @@ static void spp_rfcomm_connected(struct bt_rfcomm_dlc* rfcomm_dlc)
     sal_spp_connection_t* spp_conn;
 
     BT_LOGD("%s, rfcomm_dlc: %p", __func__, rfcomm_dlc);
+
+    bt_rfcomm_dlc_set_rx_credit_mode(rfcomm_dlc, BT_RFCOMM_RX_CREDIT_MANUAL);
 
     spp_conn_lock();
     spp_conn = spp_find_connection_by_dlc(rfcomm_dlc);
@@ -645,8 +659,8 @@ bt_status_t bt_sal_spp_server_start(uint16_t port, bt_uuid_t* uuid, uint8_t max_
     server->sdp_record = (struct bt_sdp_record*)spp_sdp_create_record(scn, uuid);
     ret = bt_sdp_register_service(server->sdp_record);
     if (ret < 0) {
-        // TODO: unregister rfcomm server
         BT_LOGE("Failed to register SDP record: %d", ret);
+        bt_rfcomm_server_unregister(&server->rfcomm_server);
         spp_sdp_remove_record(server->sdp_record);
         free(server);
         return BT_STATUS_FAIL;
@@ -982,6 +996,8 @@ bt_status_t bt_sal_spp_data_received_response(uint16_t conn_port, uint8_t* buf)
     }
 
     spp_conn_unlock();
+
+    bt_rfcomm_dlc_update_credits(&spp_conn->rfcomm_dlc);
     return BT_STATUS_SUCCESS;
 }
 
@@ -1058,4 +1074,9 @@ bt_status_t bt_sal_spp_connect_request_reply(bt_address_t* addr, uint16_t port, 
 
     BT_LOGD("Accepting SPP connection on port %d", port);
     return BT_STATUS_SUCCESS;
+}
+
+bt_status_t bt_sal_spp_connect_with_option(bt_address_t* addr, uint16_t conn_port, bt_uuid_t* uuid128, uint8_t insecure)
+{
+    return BT_STATUS_UNSUPPORTED;
 }

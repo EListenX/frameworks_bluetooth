@@ -23,6 +23,8 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "bt_uuid.h"
+
 /**
  * @cond
  */
@@ -49,6 +51,7 @@ typedef enum {
 typedef enum {
     ATTR_AUTO_RSP,
     ATTR_RSP_BY_APP,
+    ATTR_AUTO_RSP_CCC_READ,
 } gatt_attr_rsp_t;
 
 typedef enum {
@@ -144,19 +147,22 @@ typedef enum {
 
 /* GATT_H_DESCRIPTOR */
 #define GATT_H_CEPD(_value, _length, _handle) \
-    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(0x2900), GATT_PERM_READ, ATTR_AUTO_RSP, NULL, NULL, _value, _length, _handle)
+    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(BT_UUID_GATT_CEPD), GATT_PERM_READ, ATTR_AUTO_RSP, NULL, NULL, _value, _length, _handle)
 
 /* GATT_H_DESCRIPTOR */
 #define GATT_H_CUDD(_value, _length, _handle) \
-    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(0x2901), GATT_PERM_READ, ATTR_AUTO_RSP, NULL, NULL, _value, _length, _handle)
+    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(BT_UUID_GATT_CUDD), GATT_PERM_READ, ATTR_AUTO_RSP, NULL, NULL, _value, _length, _handle)
 
 /* GATT_H_DESCRIPTOR */
 #define GATT_H_CCCD(_perm, _change, _handle) \
-    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(0x2902), _perm, ATTR_RSP_BY_APP, NULL, _change, NULL, 0, _handle)
+    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(BT_UUID_GATT_CCCD), _perm, ATTR_AUTO_RSP_CCC_READ, NULL, _change, NULL, 0, _handle)
 
+/* GATT_H_DESCRIPTOR for CCCD with user response (APP handles read/write) */
+#define GATT_H_CCCD_USER_RSP(_perm, _read, _write, _handle) \
+    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(BT_UUID_GATT_CCCD), _perm, ATTR_RSP_BY_APP, _read, _write, NULL, 0, _handle)
 /* GATT_H_DESCRIPTOR */
 #define GATT_H_CPFD(_value, _length, _handle) \
-    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(0x2904), GATT_PERM_READ, ATTR_AUTO_RSP, NULL, NULL, _value, _length, _handle)
+    GATT_H_DESCRIPTOR(BT_UUID_DECLARE_16(BT_UUID_GATT_CPFD), GATT_PERM_READ, ATTR_AUTO_RSP, NULL, NULL, _value, _length, _handle)
 
 /**
  * @endcond

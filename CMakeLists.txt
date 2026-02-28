@@ -177,7 +177,7 @@ if(CONFIG_BLUETOOTH)
 
     if(CONFIG_BLUETOOTH_BLE_SCAN)
       list(APPEND CSRCS ${BLUETOOTH_DIR}/framework/socket/bt_le_scan.c)
-      list(APPEND CSRCS ${BLUETOOTH_DIR}/service/ipc/socket/src/bt_socket_le_scan.c)
+      list(APPEND CSRCS ${BLUETOOTH_DIR}/service/ipc/socket/src/bt_socket_scan.c)
     endif()
 
     if(CONFIG_BLUETOOTH_PAN)
@@ -696,10 +696,7 @@ if(CONFIG_BLUETOOTH)
     endif()
 
     if(CONFIG_BLUETOOTH_STACK_BREDR_ZBLUE OR CONFIG_BLUETOOTH_STACK_LE_ZBLUE)
-      list(APPEND INCDIR ${NUTTX_APPS_DIR}/external/zblue/zblue/port/include/)
-      list(APPEND INCDIR ${NUTTX_APPS_DIR}/external/zblue/zblue/subsys/settings/include/settings)
-      list(APPEND INCDIR
-           ${NUTTX_APPS_DIR}/external/zblue/zblue/port/include/kernel/include)
+      nuttx_add_dependencies(TARGET libbluetooth DEPENDS zblue)
     endif()
 
     list(APPEND INCDIR ${BLUETOOTH_DIR}/service/ipc)

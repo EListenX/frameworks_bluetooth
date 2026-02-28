@@ -16,7 +16,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/classic/sdp.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/l2cap.h>
@@ -28,7 +30,10 @@
 #include "gatt_define.h"
 #include "gatts_service.h"
 #include "sal_adapter_le_interface.h"
+#include "sal_connection_manager.h"
 #include "sal_interface.h"
+#include "sal_zblue.h"
+#include "sal_zephyr_interface.h"
 #include "service_loop.h"
 #include "utils/log.h"
 
@@ -57,8 +62,8 @@
 #define GATT_OPS_READ_REQUEST 1
 #define GATT_WRITE_FLAGS_RELIABLE_WRITE (BT_GATT_WRITE_FLAG_PREPARE | BT_GATT_WRITE_FLAG_EXECUTE)
 
-#define MAKE_REQUEST_ID(handle, op_type) (((uint32_t)(op_type) << 31) | ((handle)&0xFFFF))
-#define REQUEST_ID_HANDLE(id) ((uint16_t)((id)&0xFFFF))
+#define MAKE_REQUEST_ID(handle, op_type) (((uint32_t)(op_type) << 31) | ((handle) & (0xFFFF)))
+#define REQUEST_ID_HANDLE(id) ((uint16_t)((id) & (0xFFFF)))
 #define REQUEST_ID_OP_TYPE(id) (((id) >> 31) & 0x1)
 #define REQUEST_ID_NORSP ((uint32_t)0xFFFFFFFF)
 
@@ -146,12 +151,105 @@ typedef struct {
     sal_adapter_args_t adpt;
 } sal_adapter_req_t;
 
-static uint8_t attr_count;
-static uint8_t svc_attr_count;
-static uint8_t svc_count;
+typedef struct {
+    struct bt_gatt_service* srv;
+    struct bt_sdp_record* record;
+} sal_gatt_sdp_record_t;
+
+static size_t attr_count;
+static size_t svc_attr_count;
 
 static struct bt_gatt_service server_svcs[CONFIG_GATT_SERVER_MAX_SERVICES];
 static struct bt_gatt_attr server_db[CONFIG_GATT_SERVER_MAX_ATTRIBUTES];
+static sal_gatt_sdp_record_t gatt_sdp_records[CONFIG_GATT_SERVER_MAX_SERVICES];
+
+static int find_free_service_index(void)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(server_svcs); i++) {
+        if (server_svcs[i].attrs == NULL && server_svcs[i].attr_count == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static void remove_from_server_db(const struct bt_gatt_attr* start, size_t count)
+{
+    size_t index, i;
+
+    if (!start || count == 0) {
+        return;
+    }
+
+    index = start - server_db;
+
+    if (start < server_db || index >= attr_count) {
+        BT_LOGE("%s, invalid start pointer", __func__);
+        return;
+    }
+
+    if (count > attr_count || index + count > attr_count) {
+        BT_LOGE("%s, invalid count: %zu (index=%zu, attr_count=%zu)", __func__, count, index, attr_count);
+        return;
+    }
+
+    for (i = 0; i < count; i++) {
+        free(start[i].user_data);
+        free((void*)start[i].uuid);
+    }
+
+    if (index + count < attr_count) {
+        memmove(&server_db[index], &server_db[index + count],
+            (attr_count - index - count) * sizeof(struct bt_gatt_attr));
+    }
+
+    memset(&server_db[attr_count - count], 0, count * sizeof(struct bt_gatt_attr));
+    attr_count -= count;
+}
+
+/* Generic ATT SDP record */
+static struct bt_sdp_attribute gatt_attrs_template[] = {
+    BT_SDP_NEW_SERVICE,
+    BT_SDP_LIST(
+        BT_SDP_ATTR_SVCLASS_ID_LIST,
+        BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 3), /* 35 03 */
+        BT_SDP_DATA_ELEM_LIST(
+            {
+                BT_SDP_TYPE_SIZE(BT_SDP_UUID16), /* 19 */
+                BT_SDP_ARRAY_16(BT_SDP_GENERIC_ATTRIB_SVCLASS) /* 18 01 */
+            }, )),
+    BT_SDP_LIST(
+        BT_SDP_ATTR_PROTO_DESC_LIST,
+        BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 19), /* 35 13 */
+        BT_SDP_DATA_ELEM_LIST(
+            { BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 6), /* 35 06 */
+                BT_SDP_DATA_ELEM_LIST(
+                    {
+                        BT_SDP_TYPE_SIZE(BT_SDP_UUID16), /* 19 */
+                        BT_SDP_ARRAY_16(BT_SDP_PROTO_L2CAP) /* 01 00 */
+                    },
+                    {
+                        BT_SDP_TYPE_SIZE(BT_SDP_UINT16), /* 09 */
+                        BT_SDP_ARRAY_16(BT_L2CAP_PSM_ATT) /* 00 1F */
+                    }, ) },
+            { BT_SDP_TYPE_SIZE_VAR(BT_SDP_SEQ8, 9), /* 35 09 */
+                BT_SDP_DATA_ELEM_LIST(
+                    {
+                        BT_SDP_TYPE_SIZE(BT_SDP_UUID16), /* 19 */
+                        BT_SDP_ARRAY_16(BT_SDP_PROTO_ATT) /* 00 07 */
+                    },
+                    {
+                        BT_SDP_TYPE_SIZE(BT_SDP_UINT16), /* 09 */
+                        BT_SDP_ARRAY_16(0) /* 00 00, assigned in gatt_sdp_create_record */
+                    },
+                    {
+                        BT_SDP_TYPE_SIZE(BT_SDP_UINT16), /* 09 */
+                        BT_SDP_ARRAY_16(0) /* 00 00, assigned in gatt_sdp_create_record */
+                    }, ) }, )),
+};
 
 static ssize_t read_value(struct bt_conn* conn, const struct bt_gatt_attr* attr,
     void* buf, uint16_t len, uint16_t offset)
@@ -174,7 +272,7 @@ static ssize_t read_value(struct bt_conn* conn, const struct bt_gatt_attr* attr,
         return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
     }
 
-    get_le_addr_from_conn(conn, &addr);
+    bt_sal_get_remote_address(conn, &addr);
 
     request_id = MAKE_REQUEST_ID(element->handle, GATT_OPS_READ_REQUEST);
     if_gatts_on_received_element_read_request(&addr, request_id, element->handle);
@@ -217,7 +315,7 @@ static ssize_t write_value(struct bt_conn* conn, const struct bt_gatt_attr* attr
         ret = -EINPROGRESS;
     }
 
-    get_le_addr_from_conn(conn, &addr);
+    bt_sal_get_remote_address(conn, &addr);
 
     if_gatts_on_received_element_write_request(&addr, request_id, element->handle, (uint8_t*)buf, offset, len);
 
@@ -266,26 +364,141 @@ static struct bt_gatt_attr* gatt_db_add(const struct bt_gatt_attr* pattern, size
     return attr;
 }
 
-static bt_status_t register_service(void)
+static struct bt_sdp_record* gatt_sdp_create_record(struct bt_gatt_service* srv)
 {
-    int err;
+    struct bt_sdp_record* record;
+    size_t attrs_count;
+    struct bt_sdp_attribute* attrs;
+    sal_gatt_sdp_record_t* gatt_record;
+    union uuid* uuid;
 
-    server_svcs[svc_count].attrs = server_db + (attr_count - svc_attr_count);
-    server_svcs[svc_count].attr_count = svc_attr_count;
-
-    err = bt_gatt_service_register(&server_svcs[svc_count]);
-    if (err) {
-        BT_LOGD("%s, gatt service register", __func__);
-        return BT_STATUS_FAIL;
+    /* First attribute of services is service declaration(primary or secondary) */
+    uuid = srv->attrs->user_data;
+    if (uuid->uuid.type != BT_UUID_TYPE_16) {
+        BT_LOGE("Invalid UUID type: %d, only for UUID16", uuid->uuid.type);
+        return NULL;
     }
 
-    svc_count++;
+    record = zalloc(sizeof(struct bt_sdp_record));
+    if (!record) {
+        BT_LOGE("Failed to allocate memory for SDP record");
+        return NULL;
+    }
 
-    svc_attr_count = 0U;
-    return BT_STATUS_SUCCESS;
+    attrs = zalloc(sizeof(gatt_attrs_template));
+    if (!attrs) {
+        BT_LOGE("Failed to allocate memory for SDP attributes");
+        free(record);
+        return NULL;
+    }
+
+    attrs_count = ARRAY_SIZE(gatt_attrs_template);
+    memcpy(attrs, gatt_attrs_template, sizeof(gatt_attrs_template));
+
+    SDP_GATT_START_HDL_PTR_FROM_ATTR(attrs) = &srv->attrs->handle;
+    SDP_GATT_END_HDL_PTR_FROM_ATTR(attrs) = &srv->attrs[svc_attr_count - 1].handle;
+    SDP_GATT_SVCLS_PTR_FROM_ATTR(attrs) = &uuid->u16.val;
+
+    record->attr_count = attrs_count;
+    record->attrs = attrs;
+
+    for (gatt_record = gatt_sdp_records; gatt_record < gatt_sdp_records + CONFIG_GATT_SERVER_MAX_SERVICES; gatt_record++) {
+        if (gatt_record->srv) {
+            continue;
+        }
+
+        gatt_record->srv = srv;
+        gatt_record->record = record;
+        return record;
+    }
+
+    free(attrs);
+    free(record);
+    return NULL;
 }
 
-static void add_service(gatt_element_t* element)
+static void gatt_sdp_delete_record(struct bt_sdp_record* record)
+{
+    sal_gatt_sdp_record_t* gatt_record;
+
+    if (!record) {
+        BT_LOGE("Invalid SDP record");
+        return;
+    }
+
+    for (gatt_record = gatt_sdp_records; gatt_record < gatt_sdp_records + CONFIG_GATT_SERVER_MAX_SERVICES; gatt_record++) {
+        if (!gatt_record->srv) {
+            continue;
+        }
+
+        if (gatt_record->record == record) {
+            gatt_record->srv = NULL;
+            gatt_record->record = NULL;
+            break;
+        }
+    }
+
+    if (record->attrs) {
+        free(record->attrs);
+        record->attrs = NULL;
+    }
+
+    free(record);
+}
+
+static bt_status_t register_service(bool is_over_br)
+{
+    int err;
+    int service_index;
+    struct bt_sdp_record* record;
+    bt_status_t status = BT_STATUS_SUCCESS;
+
+    service_index = find_free_service_index();
+    if (service_index < 0) {
+        BT_LOGE("%s, service full", __func__);
+        status = BT_STATUS_FAIL;
+        goto out;
+    }
+
+    server_svcs[service_index].attrs = server_db + (attr_count - svc_attr_count);
+    server_svcs[service_index].attr_count = svc_attr_count;
+
+    err = bt_gatt_service_register(&server_svcs[service_index]);
+    if (err) {
+        server_svcs[service_index].attrs = NULL;
+        server_svcs[service_index].attr_count = 0;
+        BT_LOGD("%s, gatt service register %d", __func__, err);
+        status = BT_STATUS_FAIL;
+        goto out;
+    }
+
+    if (!is_over_br) {
+        goto out;
+    }
+
+    record = gatt_sdp_create_record(&server_svcs[service_index]);
+
+    if (!record) {
+        BT_LOGE("Failed to create SDP record");
+        goto out;
+    }
+
+    err = bt_sdp_register_service(record);
+    if (err != 0) {
+        BT_LOGE("GATT SDP record register fail");
+        gatt_sdp_delete_record(record);
+        goto out;
+    }
+
+out:
+    svc_attr_count = 0U;
+    if (status != BT_STATUS_SUCCESS) {
+        remove_from_server_db(server_db + (attr_count - svc_attr_count), svc_attr_count);
+    }
+    return status;
+}
+
+static void add_service(gatt_element_t* element, bool is_over_br)
 {
     struct bt_gatt_attr* attr_svc;
     union uuid u;
@@ -297,12 +510,6 @@ static void add_service(gatt_element_t* element)
     }
 
     size = u.uuid.type == BT_UUID_TYPE_16 ? sizeof(u.u16) : sizeof(u.u128);
-    if (svc_attr_count) {
-        if (register_service()) {
-            BT_LOGE("%s, register service fail", __func__);
-            return;
-        }
-    }
 
     switch (element->type) {
     case GATT_PRIMARY_SERVICE:
@@ -317,7 +524,6 @@ static void add_service(gatt_element_t* element)
     }
 
     if (!attr_svc) {
-        svc_count--;
         BT_LOGE("%s, attr_svc is null", __func__);
         return;
     }
@@ -441,7 +647,7 @@ static ssize_t bt_sal_on_ccc_written(struct bt_conn* conn, const struct bt_gatt_
 
     value = ccc->cfg[index].value;
 
-    get_le_addr_from_conn(conn, &addr);
+    bt_sal_get_remote_address(conn, &addr);
 
     if_gatts_on_received_element_write_request(&addr, GATT_OPS_WRITE_REQUEST,
         element->handle, (uint8_t*)&value, 0, sizeof(value));
@@ -565,12 +771,91 @@ static void zblue_gatts_mtu_updated_callback(struct bt_conn* conn, uint16_t tx, 
     uint16_t att_mtu = MIN(tx, rx);
     uint16_t att_payload = (att_mtu >= 23) ? (att_mtu - 3) : 20;
 
-    get_le_addr_from_conn(conn, &addr);
+    bt_sal_get_remote_address(conn, &addr);
     if_gatts_on_mtu_changed(&addr, att_payload);
 }
 
 static struct bt_gatt_cb zblue_gatt_callbacks = {
     .att_mtu_updated = zblue_gatts_mtu_updated_callback
+};
+
+static bt_status_t do_gatts_disconnect(bt_controller_id_t id, bt_address_t* bd_addr, void* user_data)
+{
+    struct bt_conn* conn;
+    int err;
+
+    conn = bt_conn_lookup_addr_br((bt_addr_t*)bd_addr);
+    if (!conn) {
+        BT_LOGE("No ACL connection found for address: %s", bt_addr_str(bd_addr));
+        return BT_STATUS_FAIL;
+    }
+
+    err = bt_att_br_disconnect(conn);
+    bt_conn_unref(conn);
+    if (err) {
+        BT_LOGE("%s, disconnect fail err:%d", __func__, err);
+        return BT_STATUS_FAIL;
+    }
+
+    return BT_STATUS_SUCCESS;
+}
+
+static void zblue_gatts_connected_callback(struct bt_conn* conn)
+{
+    if (!bt_conn_get_dst_br(conn)) {
+        return;
+    }
+
+    bt_address_t addr;
+    struct bt_conn_info info;
+    bt_conn_info_t* slot;
+
+    bt_conn_get_info(conn, &info);
+    bt_addr_set(&addr, info.br.dst->val);
+
+    slot = bt_conn_add(&addr, BT_TRANSPORT_BREDR);
+    if (!slot) {
+        BT_LOGE("%s, conn slot null", __func__);
+        return;
+    }
+
+    slot->conn = conn;
+    if (!slot->role) {
+        slot->role |= GATT_ROLE_SERVER;
+    }
+
+    if_gatts_on_connection_state_changed(&addr, PROFILE_STATE_CONNECTED);
+    bt_sal_cm_profile_connected_callback(&addr, PROFILE_GATTS, CONN_ID_DEFAULT);
+    bt_sal_profile_disconnect_register(&addr, PROFILE_GATTS, CONN_ID_DEFAULT, PRIMARY_ADAPTER, do_gatts_disconnect, NULL);
+}
+
+static void zblue_gatts_disconnected_callback(struct bt_conn* conn)
+{
+    if (!bt_conn_get_dst_br(conn)) {
+        return;
+    }
+
+    bt_address_t addr;
+    struct bt_conn_info info;
+    bt_conn_info_t* slot;
+
+    bt_conn_get_info(conn, &info);
+    bt_addr_set(&addr, info.br.dst->val);
+
+    slot = bt_conn_find(&addr, BT_TRANSPORT_BREDR);
+    if (!slot) {
+        BT_LOGE("%s, conn slot null", __func__);
+        return;
+    }
+
+    bt_conn_remove(&addr, BT_TRANSPORT_BREDR);
+    if_gatts_on_connection_state_changed(&addr, PROFILE_STATE_DISCONNECTED);
+    bt_sal_cm_profile_disconnected_callback(&addr, PROFILE_GATTS, CONN_ID_DEFAULT);
+}
+
+static struct bt_att_conn_cb zblue_att_callbacks = {
+    .connected = zblue_gatts_connected_callback,
+    .disconnected = zblue_gatts_disconnected_callback,
 };
 
 static sal_adapter_req_t* sal_adapter_req(bt_controller_id_t id, bt_address_t* addr, sal_func_t func)
@@ -633,6 +918,7 @@ static void sal_gatts_elements_callback(void* args)
 bt_status_t bt_sal_gatt_server_enable(void)
 {
     bt_gatt_cb_register(&zblue_gatt_callbacks);
+    bt_att_conn_cb_register(&zblue_att_callbacks);
 
     return BT_STATUS_SUCCESS;
 }
@@ -640,6 +926,7 @@ bt_status_t bt_sal_gatt_server_enable(void)
 bt_status_t bt_sal_gatt_server_disable(void)
 {
     bt_gatt_cb_unregister(&zblue_gatt_callbacks);
+    bt_att_conn_cb_unregister(&zblue_att_callbacks);
 
     return BT_STATUS_SUCCESS;
 }
@@ -649,6 +936,7 @@ bt_status_t bt_sal_gatt_server_add_elements(gatt_element_t* elements, uint16_t s
     size_t index;
     bt_status_t status;
     sal_adapter_req_t* req;
+    bool is_over_bredr = false;
 
     if (!elements || size == 0)
         return BT_STATUS_PARM_INVALID;
@@ -659,10 +947,10 @@ bt_status_t bt_sal_gatt_server_add_elements(gatt_element_t* elements, uint16_t s
         case GATT_SECONDARY_SERVICE:
             /* Workaround: BR/EDR services to be registered over BLE as well */
             if (elements[index].properties & GATT_PROP_EXPOSED_OVER_BREDR) {
-                elements[index].properties &= ~GATT_PROP_EXPOSED_OVER_BREDR;
+                is_over_bredr = true;
                 BT_LOGD("BR/EDR service to be registered over BLE");
             }
-            add_service(&elements[index]);
+            add_service(&elements[index], is_over_bredr);
             break;
         case GATT_CHARACTERISTIC:
             add_characteristic(&elements[index]);
@@ -680,7 +968,7 @@ bt_status_t bt_sal_gatt_server_add_elements(gatt_element_t* elements, uint16_t s
     if (!req)
         return BT_STATUS_NOMEM;
 
-    status = register_service();
+    status = register_service(is_over_bredr);
     if (status != BT_STATUS_SUCCESS) {
         free(req);
         return status;
@@ -692,6 +980,27 @@ bt_status_t bt_sal_gatt_server_add_elements(gatt_element_t* elements, uint16_t s
     req->adpt.attr_op.type = GATTS_CB_TYPE_ADDED;
 
     return sal_send_req((void*)req);
+}
+
+static sal_gatt_sdp_record_t* get_sdp_from_service(struct bt_gatt_service* srv)
+{
+    sal_gatt_sdp_record_t* record;
+
+    if (!srv) {
+        return NULL;
+    }
+
+    for (record = gatt_sdp_records; record < gatt_sdp_records + CONFIG_GATT_SERVER_MAX_SERVICES; record++) {
+        if (!record->srv) {
+            continue;
+        }
+        if (record->srv == srv) {
+            return record;
+        }
+    }
+
+    BT_LOGW("%s not found sdp_record", __func__);
+    return NULL;
 }
 
 static struct bt_gatt_service* get_primary_service_from_element(gatt_element_t* element)
@@ -729,9 +1038,16 @@ static void remove_service(gatt_element_t* element)
     size_t i, count, index;
     struct bt_gatt_attr* start;
     struct bt_gatt_service* svc = get_primary_service_from_element(element);
+    sal_gatt_sdp_record_t* record;
     if (!svc) {
         BT_LOGW("%s, service not found", __func__);
         return;
+    }
+
+    record = get_sdp_from_service(svc);
+    if (record && record->record) {
+        bt_sdp_unregister_service(record->record);
+        gatt_sdp_delete_record(record->record);
     }
 
     bt_gatt_service_unregister(svc);
@@ -740,20 +1056,9 @@ static void remove_service(gatt_element_t* element)
     count = svc->attr_count;
     index = start - server_db;
 
-    for (i = 0; i < count; i++) {
-        free(start[i].user_data);
-        free((void*)start[i].uuid);
-    }
+    remove_from_server_db(start, count);
 
-    if (index + count < attr_count) {
-        memmove(&server_db[index], &server_db[index + count],
-            (attr_count - index - count) * sizeof(struct bt_gatt_attr));
-    }
-
-    memset(&server_db[attr_count - count], 0, count * sizeof(struct bt_gatt_attr));
-    attr_count -= count;
-
-    for (i = 0; i < svc_count; i++) {
+    for (i = 0; i < ARRAY_SIZE(server_svcs); i++) {
         struct bt_gatt_service* s = &server_svcs[i];
         if (!s->attrs) {
             continue;
@@ -766,7 +1071,6 @@ static void remove_service(gatt_element_t* element)
 
     svc->attrs = NULL;
     svc->attr_count = 0;
-    svc_count--;
 
     BT_LOGD("%s, removed service at index %zu, attr_count now %u", __func__, index, attr_count);
 }
@@ -811,7 +1115,7 @@ static void STACK_CALL(conn_connect)(void* args)
     struct bt_conn* conn = NULL;
     int err;
 
-    if (le_conn_set_role(&req->addr, GATT_ROLE_SERVER) != BT_STATUS_SUCCESS) {
+    if (bt_conn_set_role(BT_TRANSPORT_BLE, &req->addr, GATT_ROLE_SERVER) != BT_STATUS_SUCCESS) {
         return;
     }
 
@@ -820,15 +1124,107 @@ static void STACK_CALL(conn_connect)(void* args)
 
     err = bt_conn_le_create(&address, BT_CONN_LE_CREATE_CONN, BT_LE_CONN_PARAM_DEFAULT, &conn);
     if (err) {
-        le_conn_remove(&req->addr);
+        bt_conn_remove(&req->addr, BT_TRANSPORT_BLE);
         BT_LOGE("%s, failed to create connection (%d)", __func__, err);
         return;
     }
 }
 
+static bt_status_t gatts_br_profile_connect(bt_controller_id_t id, bt_address_t* addr, void* user_data)
+{
+    struct bt_conn* conn = bt_conn_lookup_addr_br((bt_addr_t*)addr);
+    int err;
+
+    if (!conn) {
+        BT_LOGE("%s, acl not connected", __func__);
+        return BT_STATUS_FAIL;
+    }
+
+    err = bt_att_br_connect(conn);
+    if (err) {
+        BT_LOGE("%s, ATT over BR connect failed", __func__);
+        goto error;
+    }
+
+    bt_conn_unref(conn);
+    return BT_STATUS_SUCCESS;
+
+error:
+    bt_conn_unref(conn);
+    return BT_STATUS_FAIL;
+}
+
+static void STACK_CALL(conn_br_connect)(void* args)
+{
+    sal_adapter_req_t* req = args;
+    bt_status_t status;
+
+    if (bt_conn_set_role(BT_TRANSPORT_BREDR, &req->addr, GATT_ROLE_SERVER) != BT_STATUS_SUCCESS) {
+        return;
+    }
+
+    status = bt_sal_profile_connect_request(&req->addr, PROFILE_GATTS, CONN_ID_DEFAULT, req->id, gatts_br_profile_connect, NULL);
+    if (status != BT_STATUS_SUCCESS) {
+        bt_conn_remove(&req->addr, BT_TRANSPORT_BREDR);
+        BT_LOGE("%s, PROFILE_GATTS connect failed", __func__);
+    }
+}
+
 bt_status_t bt_sal_gatt_server_connect_bear(bt_controller_id_t id, bt_address_t* addr, ble_addr_type_t addr_type, uint8_t bear_type)
 {
-    return BT_STATUS_UNSUPPORTED;
+    sal_adapter_req_t* req;
+    uint8_t type;
+
+    switch (bear_type) {
+    case ATT_BEAR_TYPE_LE_ATT:
+        req = sal_adapter_req(id, addr, STACK_CALL(conn_connect));
+        break;
+    case ATT_BEAR_TYPE_BR_ATT:
+        req = sal_adapter_req(id, addr, STACK_CALL(conn_br_connect));
+        break;
+    default:
+        BT_LOGE("%s, unsupported bear_type:%d", __func__, bear_type);
+        return BT_STATUS_UNSUPPORTED;
+    }
+
+    if (!req) {
+        BT_LOGE("%s, req null", __func__);
+        return BT_STATUS_NOMEM;
+    }
+
+    if (bear_type == ATT_BEAR_TYPE_BR_ATT) {
+        /* ATT_BEAR_TYPE_BR_ATT Skip addr_type convert */
+        return sal_send_req(req);
+    }
+
+    switch (addr_type) {
+    case BT_LE_ADDR_TYPE_PUBLIC:
+        type = BT_ADDR_LE_PUBLIC;
+        break;
+    case BT_LE_ADDR_TYPE_RANDOM:
+        type = BT_ADDR_LE_RANDOM;
+        break;
+    case BT_LE_ADDR_TYPE_PUBLIC_ID:
+        type = BT_ADDR_LE_PUBLIC_ID;
+        break;
+    case BT_LE_ADDR_TYPE_RANDOM_ID:
+        type = BT_ADDR_LE_RANDOM_ID;
+        break;
+    case BT_LE_ADDR_TYPE_ANONYMOUS:
+        type = BT_ADDR_LE_ANONYMOUS;
+        break;
+    case BT_LE_ADDR_TYPE_UNKNOWN:
+        type = BT_ADDR_LE_RANDOM;
+        break;
+    default:
+        BT_LOGE("%s, invalid type:%d", __func__, addr_type);
+        assert(0);
+    }
+
+    BT_LOGD("%s, addr_type:%d, type:%d", __func__, addr_type, type);
+    req->addr_type = type;
+
+    return sal_send_req(req);
 }
 
 bt_status_t bt_sal_gatt_server_connect(bt_controller_id_t id, bt_address_t* addr, ble_addr_type_t addr_type)
@@ -881,7 +1277,7 @@ static void STACK_CALL(conn_cancel)(void* args)
     conn = get_le_conn_from_addr(&req->addr);
     if (!conn) {
         BT_LOGE("%s, conn null", __func__);
-        return;
+        goto br_disconn;
     }
 
     err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
@@ -889,6 +1285,9 @@ static void STACK_CALL(conn_cancel)(void* args)
         BT_LOGE("%s, disconnect fail err:%d", __func__, err);
         return;
     }
+
+br_disconn:
+    bt_sal_profile_disconnect_request(&req->addr, PROFILE_GATTS, CONN_ID_DEFAULT, PRIMARY_ADAPTER, do_gatts_disconnect, NULL);
 }
 
 bt_status_t bt_sal_gatt_server_cancel_connection(bt_controller_id_t id, bt_address_t* addr)
@@ -913,10 +1312,21 @@ bt_status_t bt_sal_gatt_server_send_response(bt_controller_id_t id, bt_address_t
     if (!addr || request_id == REQUEST_ID_NORSP) {
         return BT_STATUS_PARM_INVALID;
     }
+
+    /* FIXME: If the LE address matches the BREDR address, only the LE connection will send rsp. */
     conn = get_le_conn_from_addr(addr);
     if (!conn) {
-        return BT_STATUS_NOT_FOUND;
+        bt_conn_info_t* info;
+        BT_LOGW("%s, le conn null", __func__);
+
+        info = bt_conn_find(addr, BT_TRANSPORT_BREDR);
+        conn = info ? info->conn : NULL;
+        if (!conn) {
+            BT_LOGE("%s, br conn null", __func__);
+            return BT_STATUS_NOT_FOUND;
+        }
     }
+
     handle = REQUEST_ID_HANDLE(request_id);
     op_type = REQUEST_ID_OP_TYPE(request_id);
     switch (op_type) {
@@ -945,7 +1355,7 @@ static void send_notification_result(struct bt_conn* conn, void* user_data)
         return;
     }
 
-    get_le_addr_from_conn(conn, &addr);
+    bt_sal_get_remote_address(conn, &addr);
 
     if_gatts_on_notification_sent(&addr, element->handle, GATT_STATUS_SUCCESS);
 }
@@ -991,10 +1401,18 @@ bt_status_t bt_sal_gatt_server_send_notification(bt_controller_id_t id, bt_addre
         .element = element,
     };
 
+    /* FIXME: If the LE address matches the BREDR address, only the LE connection will be notified. */
     context.conn = get_le_conn_from_addr(addr);
     if (!context.conn) {
-        BT_LOGE("%s, conn null", __func__);
-        return BT_STATUS_FAIL;
+        bt_conn_info_t* info;
+        BT_LOGW("%s, le conn null", __func__);
+
+        info = bt_conn_find(addr, BT_TRANSPORT_BREDR);
+        context.conn = info ? info->conn : NULL;
+        if (!context.conn) {
+            BT_LOGE("%s, br conn null", __func__);
+            return BT_STATUS_FAIL;
+        }
     }
 
     bt_gatt_foreach_attr(0x0001, 0xffff, gatt_send_notification, (void*)&context);
@@ -1027,7 +1445,7 @@ static void send_indication_result(struct bt_conn* conn, struct bt_gatt_indicate
         return;
     }
 
-    get_le_addr_from_conn(conn, &addr);
+    bt_sal_get_remote_address(conn, &addr);
 
     if (err) {
         BT_LOGE("%s, send indication failed for handle:0x%04x", __func__, element->handle);
@@ -1082,10 +1500,18 @@ bt_status_t bt_sal_gatt_server_send_indication(bt_controller_id_t id, bt_address
         .element = element,
     };
 
+    /* FIXME: If the LE address matches the BREDR address, only the LE connection will be indicated. */
     context.conn = get_le_conn_from_addr(addr);
     if (!context.conn) {
-        BT_LOGE("%s, conn null", __func__);
-        return BT_STATUS_FAIL;
+        bt_conn_info_t* info;
+        BT_LOGW("%s, le conn null", __func__);
+
+        info = bt_conn_find(addr, BT_TRANSPORT_BREDR);
+        context.conn = info ? info->conn : NULL;
+        if (!context.conn) {
+            BT_LOGE("%s, br conn null", __func__);
+            return BT_STATUS_FAIL;
+        }
     }
 
     bt_gatt_foreach_attr(0x0001, 0xffff, gatt_send_indication, (void*)&context);
